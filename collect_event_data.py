@@ -193,6 +193,76 @@ def _extract_json_block(text: str) -> str:
     return m.group(0) if m else ""
 
 
+def _repair_json(json_text: str) -> str:
+    """
+    Attempt to repair common JSON syntax errors.
+    Returns the repaired JSON string or the original if repair fails.
+    """
+    if not json_text:
+        return json_text
+    
+    # Common JSON repair patterns - more conservative approach
+    repairs = [
+        # Fix trailing commas in objects and arrays (most common)
+        (r',(\s*[}\]])', r'\1'),
+        # Fix single quotes to double quotes (but be careful with nested quotes)
+        (r"'([^']*)'", r'"\1"'),
+        # Fix missing closing braces/brackets at the end
+        (r'(\{[^{}]*)$', r'\1}'),
+        (r'(\[[^\[\]]*)$', r'\1]'),
+        # Fix boolean values without quotes (only if they're not already quoted)
+        (r':\s*true\s*([,}\]])', r': true\1'),
+        (r':\s*false\s*([,}\]])', r': false\1'),
+        (r':\s*null\s*([,}\]])', r': null\1'),
+    ]
+    
+    repaired = json_text
+    for pattern, replacement in repairs:
+        try:
+            repaired = re.sub(pattern, replacement, repaired)
+        except Exception:
+            continue
+    
+    return repaired
+
+
+def _validate_and_repair_json(content: str) -> tuple[str, bool]:
+    """
+    Validate JSON and attempt repair if invalid.
+    Returns (json_text, was_repaired).
+    """
+    # First try to extract JSON block
+    json_text = _extract_json_block(content)
+    if not json_text:
+        return content, False
+    
+    # Try to parse the extracted JSON
+    try:
+        json.loads(json_text)
+        return json_text, False  # Valid JSON, no repair needed
+    except json.JSONDecodeError:
+        pass
+    
+    # Attempt repair
+    repaired = _repair_json(json_text)
+    try:
+        json.loads(repaired)
+        return repaired, True  # Repair successful
+    except json.JSONDecodeError:
+        pass
+    
+    # If repair failed, try repairing the original content
+    repaired_original = _repair_json(content)
+    try:
+        json.loads(repaired_original)
+        return repaired_original, True  # Repair successful on original
+    except json.JSONDecodeError:
+        pass
+    
+    # All repair attempts failed
+    return json_text, False
+
+
 def _validate_params(year: int, month: int) -> None:
     """Validate year and month inputs with informative errors."""
     if not isinstance(year, int) or not (1900 <= year <= 2100):
@@ -375,21 +445,16 @@ def fetch_negative_bank_events(
         if not content or not isinstance(content, str):
             raise PerplexityAPIError("API response missing message.content string.")
 
-        # Try strict parse first; fall back to extracting a JSON block if needed.
-        json_text = content
+        # Try to parse and repair JSON if needed
+        json_text, was_repaired = _validate_and_repair_json(content)
+        
         try:
             data = json.loads(json_text)
-        except json.JSONDecodeError:
-            json_text = _extract_json_block(content)
-            if not json_text:
-                raise JSONStructureError(
-                    "Model did not return JSON or a parsable JSON block. "
-                    "Consider tightening the prompt."
-                )
-            try:
-                data = json.loads(json_text)
-            except json.JSONDecodeError as e:
-                raise JSONStructureError(f"Returned content is not valid JSON: {e}") from e
+            if was_repaired:
+                print(f"  (JSON repaired successfully)")
+        except json.JSONDecodeError as e:
+            # If repair failed, this is a JSONStructureError
+            raise JSONStructureError(f"Returned content is not valid JSON and could not be repaired: {e}") from e
 
         # Minimal schema validation
         _validate_min_schema(data)
@@ -424,6 +489,16 @@ def json_to_bank_events_table(json_data: Dict[str, Any]) -> pd.DataFrame:
     # Initialize list to store flattened records
     records = []
     
+    # Helper to coerce possibly-null/invalid numeric values to a number
+    def _num(value: Any) -> float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            # Try parse strings like "123.45"
+            return float(value)
+        except Exception:
+            return 0.0
+
     # Process each event
     for event in json_data.get("events", []):
         record = {}
@@ -469,7 +544,7 @@ def json_to_bank_events_table(json_data: Dict[str, Any]) -> pd.DataFrame:
         
         # Drivers
         drivers = rep_damage.get("drivers", {})
-        record["fine_usd"] = drivers.get("fine_usd", 0)
+        record["fine_usd"] = _num(drivers.get("fine_usd"))
         record["customers_affected"] = drivers.get("customers_affected", None)
         record["service_disruption_hours"] = drivers.get("service_disruption_hours", None)
         record["executive_changes"] = drivers.get("executive_changes", False)
@@ -481,16 +556,16 @@ def json_to_bank_events_table(json_data: Dict[str, Any]) -> pd.DataFrame:
         
         # Amounts
         amounts = event.get("amounts", {})
-        record["penalties_usd"] = amounts.get("penalties_usd", 0)
-        record["settlements_usd"] = amounts.get("settlements_usd", 0)
-        record["other_amounts_usd"] = amounts.get("other_amounts_usd", 0)
+        record["penalties_usd"] = _num(amounts.get("penalties_usd"))
+        record["settlements_usd"] = _num(amounts.get("settlements_usd"))
+        record["other_amounts_usd"] = _num(amounts.get("other_amounts_usd"))
         record["amounts_original_text"] = amounts.get("original_text", "")
         
         # Calculate total financial impact
         record["total_financial_impact_usd"] = (
-            record["penalties_usd"] + 
-            record["settlements_usd"] + 
-            record["other_amounts_usd"]
+            float(record["penalties_usd"]) +
+            float(record["settlements_usd"]) +
+            float(record["other_amounts_usd"])
         )
         
         # Sources information
@@ -557,6 +632,20 @@ def json_to_bank_events_table(json_data: Dict[str, Any]) -> pd.DataFrame:
     # Convert last_updated to datetime (timezone-naive for Excel compatibility)
     if "data_last_updated" in df.columns:
         df["data_last_updated"] = pd.to_datetime(df["data_last_updated"], errors='coerce').dt.tz_localize(None)
+
+    # Ensure numeric columns are numeric and not None
+    numeric_columns = [
+        "penalties_usd",
+        "settlements_usd",
+        "other_amounts_usd",
+        "total_financial_impact_usd",
+        "fine_usd",
+        "customers_affected",
+        "service_disruption_hours",
+    ]
+    for ncol in numeric_columns:
+        if ncol in df.columns:
+            df[ncol] = pd.to_numeric(df[ncol], errors='coerce').fillna(0)
     
     return df
 
@@ -684,10 +773,45 @@ def collect_all_bank_events(start_year: int = 2000, start_month: int = 1,
     for idx, (year, month) in enumerate(months_to_process, 1):
         print(f"Processing {year}-{month:02d} ({idx}/{total_months})...", end=" ")
         
-        try:
-            # Fetch data for current month
-            result_json = fetch_negative_bank_events(year, month, model=model)
-            
+        # Retry logic for API calls
+        max_retries_per_month = 2
+        retry_count = 0
+        result_json = None
+        
+        while retry_count <= max_retries_per_month:
+            try:
+                # Fetch data for current month
+                result_json = fetch_negative_bank_events(year, month, model=model)
+                break  # Success, exit retry loop
+                
+            except JSONStructureError as err:
+                retry_count += 1
+                if retry_count <= max_retries_per_month:
+                    print(f"  (JSON error, retrying {retry_count}/{max_retries_per_month})...")
+                    time.sleep(delay_seconds * 2)  # Longer delay for retries
+                    continue
+                else:
+                    print(f"✗ JSON error after {max_retries_per_month} retries: {err}")
+                    # Store empty/error entry for this month
+                    monthly_data.append({
+                        'year': year,
+                        'month': month,
+                        'json_output': json.dumps({"error": str(err), "events": []})
+                    })
+                    break
+                    
+            except (ValueError, PerplexityAPIError) as err:
+                print(f"✗ Error: {err}")
+                # Store empty/error entry for this month
+                monthly_data.append({
+                    'year': year,
+                    'month': month,
+                    'json_output': json.dumps({"error": str(err), "events": []})
+                })
+                break
+        
+        # Process successful result
+        if result_json is not None:
             # Store monthly JSON data
             monthly_data.append({
                 'year': year,
@@ -708,22 +832,6 @@ def collect_all_bank_events(start_year: int = 2000, start_month: int = 1,
             # Add delay between API calls to avoid rate limiting
             if idx < total_months:  # Don't delay after the last request
                 time.sleep(delay_seconds)
-                
-        except (ValueError, PerplexityAPIError, JSONStructureError) as err:
-            print(f"✗ Error: {err}")
-            # Store empty/error entry for this month
-            monthly_data.append({
-                'year': year,
-                'month': month,
-                'json_output': json.dumps({"error": str(err), "events": []})
-            })
-        except Exception as err:
-            print(f"✗ Unexpected error: {err}")
-            monthly_data.append({
-                'year': year,
-                'month': month,
-                'json_output': json.dumps({"error": str(err), "events": []})
-            })
     
     print("=" * 60)
     print("Data collection complete!")
@@ -733,10 +841,17 @@ def collect_all_bank_events(start_year: int = 2000, start_month: int = 1,
     
     # Create events DataFrame
     if all_events:
-        events_df = pd.concat(all_events, ignore_index=True)
-        # Reorder columns to put year and month first
-        cols = ['year', 'month'] + [col for col in events_df.columns if col not in ['year', 'month']]
-        events_df = events_df[cols]
+        # Filter out empty DataFrames to avoid FutureWarning
+        non_empty_events = [df for df in all_events if not df.empty]
+        if non_empty_events:
+            events_df = pd.concat(non_empty_events, ignore_index=True)
+            # Reorder columns to put year and month first
+            cols = ['year', 'month'] + [col for col in events_df.columns if col not in ['year', 'month']]
+            events_df = events_df[cols]
+        else:
+            # If all DataFrames were empty, create empty DataFrame with expected columns
+            events_df = pd.DataFrame(columns=['year', 'month', 'date', 'bank', 'event_type', 
+                                             'description', 'severity', 'link'])
     else:
         # Create empty DataFrame with expected columns if no events found
         events_df = pd.DataFrame(columns=['year', 'month', 'date', 'bank', 'event_type', 
