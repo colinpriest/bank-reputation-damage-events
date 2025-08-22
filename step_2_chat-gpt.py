@@ -1,7 +1,7 @@
 import os
 import json
-import time
-from typing import List, Optional
+import instructor
+from typing import List
 from enum import Enum
 
 import pandas as pd
@@ -43,7 +43,7 @@ class MediaArticle(BaseModel):
 class MediaArticleResponse(BaseModel):
     articles: List[MediaArticle]
 
-# --- Main Function (With Cleaning Fix) ---
+# --- Main Function (Refactored with Instructor) ---
 
 def fetch_bank_event_media_coverage(
     bank_name: str,
@@ -54,73 +54,60 @@ def fetch_bank_event_media_coverage(
     timeout_seconds: int = 120,
 ) -> List[MediaArticle]:
     """
-    Fetches media coverage using the new, simplified OpenAI Responses API with built-in web search.
+    Fetches media coverage using the OpenAI API and the Instructor library
+    to directly return a validated Pydantic model.
     """
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=timeout_seconds)
+    # ✅ 1. Patch the OpenAI client with Instructor
+    client = instructor.patch(
+        OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=timeout_seconds)
+    )
 
+    # ✅ 2. The prompt now only focuses on the task, not the output format.
     prompt = (
         f"Find media articles from US-based news publishers about the {bank_name} "
-        f"scandal in {year} related to: '{case_study_summary}'. Exclude non-news aggregators and Wikipedia."
-    )
-
-    instructions = (
-        "Perform a web search to find relevant articles. "
-        "Your output must be ONLY a single, valid JSON object with a key 'articles', "
-        "which contains an array of article objects. Each article object must have the fields: "
-        "'title', 'url', 'source', 'date', 'summary', 'sentiment', and 'sentiment_score'. "
-        "Do not include any prose, markdown, or other text in your response."
+        f"scandal in {year} related to: '{case_study_summary}'. Exclude non-news aggregators and Wikipedia. "
+        "Perform a web search to find the most relevant articles."
     )
 
     try:
-        response = client.responses.create(
+        # ✅ 3. Call the API with `response_model` to get a structured Pydantic object back.
+        # No more manual JSON cleaning or parsing is needed.
+        validated_response = client.chat.completions.create(
             model=model,
-            input=prompt,
-            instructions=instructions,
+            response_model=MediaArticleResponse,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
         )
-        raw_text = response.output_text
-
-    except APIError as e:
-        raise MediaDataError(f"OpenAI API error: {e}") from e
-    except Exception as e:
-        raise MediaDataError(f"An unexpected error occurred during the API call: {e}") from e
-
-    if not raw_text or not raw_text.strip():
-        raise MediaDataError("The model returned an empty response.")
-        
-    # ✅ FIX: Clean the string to remove markdown fences before parsing.
-    json_str = raw_text.strip()
-    if json_str.startswith("```json"):
-        json_str = json_str[7:]
-    if json_str.startswith("```"):
-        json_str = json_str[3:]
-    if json_str.endswith("```"):
-        json_str = json_str[:-3]
-    json_str = json_str.strip()
-        
-    try:
-        validated_response = MediaArticleResponse.model_validate_json(json_str)
         return validated_response.articles
-    except ValidationError as e:
-        snippet = json_str[:500].replace("\n", " ")
-        raise MediaDataError(f"Pydantic validation failed: {e}\nModel returned: {snippet}")
+    except (APIError, ValidationError) as e:
+        # Instructor will raise a ValidationError if the model's output doesn't match the schema
+        raise MediaDataError(f"API or validation error: {e}") from e
+    except Exception as e:
+        raise MediaDataError(f"An unexpected error occurred: {e}") from e
 
-# --- CLI Entrypoint (Unchanged) ---
+
+# --- CLI Entrypoint (Largely Unchanged) ---
 
 if __name__ == "__main__":
     try:
         print("Loading Excel files...")
         events_df = pd.read_excel("./event_spreadsheets/US_bank_Reputational_Damage_2015_2025 - Claude.xlsx")
 
-        iRow = 0
+        iRow = 3
         bank_name = str(events_df.iloc[iRow]["Bank"])
         year = str(events_df.iloc[iRow]["Case Name + Year"])[-4:]
         case_study_summary = str(events_df.iloc[iRow]["Event Summary"])
 
         print("\n" + "=" * 80)
-        print("Searching for media articles using the new Responses API:")
-        print(f"  Bank:    {bank_name}")
-        print(f"  Year:    {year}")
-        print(f"  Summary: {case_study_summary[:150]}...")
+        # Updated print statement to reflect the use of Instructor
+        print("Searching for media articles using OpenAI with Instructor:")
+        print(f"  Bank:     {bank_name}")
+        print(f"  Year:     {year}")
+        print(f"  Summary:  {case_study_summary[:150]}...")
         print("=" * 80 + "\n")
 
         articles = fetch_bank_event_media_coverage(
@@ -130,11 +117,14 @@ if __name__ == "__main__":
             model="gpt-4o",
         )
         
-        print(f"\n✅ Success! Found {len(articles)} articles.\n")
-        pretty_json = json.dumps([a.model_dump(mode='json') for a in articles], indent=2)
-        print(pretty_json)
+        if not articles:
+             print("\n⚠️ Warning: No articles were found for the given criteria.")
+        else:
+            print(f"\n✅ Success! Found {len(articles)} articles.\n")
+            pretty_json = json.dumps([a.model_dump(mode='json') for a in articles], indent=2)
+            print(pretty_json)
 
-    except (MediaDataError, ValidationError, ValueError, FileNotFoundError) as e:
+    except (MediaDataError, FileNotFoundError) as e:
         print(f"❌ Error: {e}")
     except Exception as e:
         print(f"An unexpected application error occurred: {e}")
