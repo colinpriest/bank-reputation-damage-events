@@ -175,6 +175,30 @@ def google_custom_search(query: str, api_key: str, cse_id: str, total_results_to
             raise MediaDataError(f"Google Search API error on page {page + 1}: {e}") from e
     return all_results[:total_results_to_fetch]
 
+# --- Pydantic Models & Data Structures ---
+# Add this new Pydantic model at the top with the other models
+class MediaArticleSchema(BaseModel):
+    title: str
+    url: HttpUrl = Field(..., alias="link")
+    source: str
+    date: str
+    summary: str
+    sentiment: Sentiment
+    sentiment_score: float
+    is_relevant: bool = Field(description="True if the article is directly about the specified event and entity.")
+    relevance_reason: str = Field(description="A brief reason for the relevance decision.")
+    main_entity: str = Field(description="The main company, organization, or person the article is about.")
+    customer_impact: bool = Field(description="True if the event described will directly impact the bank's customers.")
+
+    @field_validator("sentiment_score")
+    @classmethod
+    def score_in_range(cls, v: float) -> float:
+        if not -1.0 <= v <= 1.0:
+            raise ValueError("sentiment_score must be between -1.0 and 1.0")
+        return v
+
+
+# --- Core Functions ---
 def fetch_and_process_media_coverage(
     bank_name: str,
     year: str,
@@ -236,8 +260,22 @@ def fetch_and_process_media_coverage(
                         extracted_text = []
                         with pdfplumber.open(pdf_file) as pdf:
                             for pdf_page in pdf.pages:
-                                page_text = pdf_page.extract_text()
-                                if page_text: extracted_text.append(page_text)
+                                try:
+                                    page_text = pdf_page.extract_text()
+                                    if page_text: extracted_text.append(page_text)
+                                except Exception as pdf_error:
+                                    # Handle pdfplumber color-related errors gracefully
+                                    error_str = str(pdf_error).lower()
+                                    if ("color" in error_str or "stroke" in error_str or 
+                                        "invalid float value" in error_str or 
+                                        "components are specified" in error_str or
+                                        "grayscale" in error_str or "rgb" in error_str or "cmyk" in error_str or
+                                        "p2" in error_str):  # Catch any P2xx object errors
+                                        print(f"     - ⚠️ PDF color/format error on page, skipping: {pdf_error}")
+                                        continue
+                                    else:
+                                        # Re-raise non-color related errors
+                                        raise pdf_error
                         text = "\n".join(extracted_text)
                         break  # Success, exit retry loop
                     elif url:
@@ -279,10 +317,10 @@ def fetch_and_process_media_coverage(
                 "title": postprocess_to_ascii(item.get("title")),
                 "link": url,
                 "snippet": postprocess_to_ascii(item.get("snippet")),
-                "full_text": postprocess_to_ascii(processed_text)
+                "source": urlparse(url).netloc, 
+                "date": item.get('pubdate') or item.get('pagemap', {}).get('metatags', [{}])[0].get('article:published_time', 'unknown')
             }
             
-            formatted_results = json.dumps(scraped_article_data, indent=2)
             prompt = f"""Based ONLY on the provided JSON data for a SINGLE article, your task is to analyze it and extract the following:
 1. Core Info: title, link (as 'url'), and a concise 'summary'.
 2. Metadata: source, date, sentiment, and sentiment_score.
@@ -290,28 +328,36 @@ def fetch_and_process_media_coverage(
 4. Customer Impact: A 'customer_impact' boolean.
 5. {relevance_instruction}
 6. Relevance Reason: A 'relevance_reason'.
-7. Full Text: Copy the provided 'full_text' into the output.
-ARTICLE DATA: {formatted_results}"""
+
+Article Data: {json.dumps(scraped_article_data, indent=2)}
+
+Full Article Text (for analysis only, do NOT copy into output):
+---
+{postprocess_to_ascii(processed_text)}
+---
+"""
 
             try:
-                article = client.chat.completions.create(
+                article_schema = client.chat.completions.create(
                     model=model, 
                     messages=[{"role": "system", "content": "You are an expert data processing assistant. Your output must strictly adhere to the requested Pydantic schema."}, {"role": "user", "content": prompt}], 
-                    response_model=MediaArticle,
-                    max_tokens=8000
+                    response_model=MediaArticleSchema,
+                    max_tokens=2000 
                 )
                 
-                article.title = postprocess_to_ascii(article.title)
-                article.summary = postprocess_to_ascii(article.summary)
-                article.relevance_reason = postprocess_to_ascii(article.relevance_reason)
-                article.main_entity = postprocess_to_ascii(article.main_entity)
-                article.full_text = postprocess_to_ascii(article.full_text)
+                # *** THIS IS THE FIX ***
+                # Dump the model using aliases to ensure the 'link' key is present
+                article_data = article_schema.model_dump(by_alias=True)
                 
-                all_processed_articles.append(article)
+                # Manually reconstruct the full MediaArticle object
+                article = MediaArticle(**article_data, full_text=postprocess_to_ascii(processed_text))
+
                 print(f"     - Successfully processed and cleaned.")
             except (APIError, ValidationError) as e:
                 print(f"     - ⚠️ Error processing article: {e}. Skipping.")
                 continue
+            
+            all_processed_articles.append(article)
             time.sleep(1) 
         browser.close()
     return all_processed_articles
@@ -322,42 +368,76 @@ if __name__ == "__main__":
         # NOTE: You will need to have a file named "us_bank_reputation_events_final.xlsx"
         # with columns 'institutions', 'date_first_public', and 'title'.
         events_df = pd.read_excel("us_bank_reputation_events_final.xlsx")
-        iRow = 0
-        event_id = str(events_df.iloc[iRow]["event_id"])
-        bank_name = ast.literal_eval(str(events_df.iloc[iRow]["institutions"]))[0]
-        date_first_public = events_df.iloc[iRow]["date_first_public"]
-        year = date_first_public.year
-        case_study_summary = str(events_df.iloc[iRow]["title"])
         
         TOTAL_ARTICLES_TO_FIND = 50
-        SEARCH_START_DATE = date_first_public.strftime('%Y-%m-%d')
-        SEARCH_END_DATE = (date_first_public + timedelta(days=90)).strftime('%Y-%m-%d')
-
-        print("\n" + "=" * 80 + "\nStarting Workflow...")
-        articles = fetch_and_process_media_coverage(
-            bank_name, 
-            str(year), 
-            case_study_summary, 
-            num_articles_to_find=TOTAL_ARTICLES_TO_FIND, 
-            start_date=SEARCH_START_DATE, 
-            end_date=SEARCH_END_DATE
-        )
-        print(f"\n✅ Success! Processed {len(articles)} articles.\n")
-        
-        final_json = {
-            "event_id": event_id,
-            "bank_name": bank_name, "year": year, "case_study_summary": case_study_summary,
-            "article_count": len(articles),
-            "articles": [a.model_dump(mode='json') for a in articles if a.is_relevant]
-        }
-        
         output_dir = "./news_articles"
         os.makedirs(output_dir, exist_ok=True)
-        output_filename = os.path.join(output_dir, f"{bank_name.replace(' ', '_')}_{year}_media_analysis.json")
+        
+        print(f"\n" + "=" * 80)
+        print(f"Starting Workflow for {len(events_df)} events...")
+        print("=" * 80)
+        
+        for iRow in range(len(events_df)):
+            try:
+                print(f"\n{'='*60}")
+                print(f"Processing Event {iRow + 1} of {len(events_df)}")
+                print(f"{'='*60}")
+                
+                event_id = str(events_df.iloc[iRow]["event_id"])
+                bank_name = ast.literal_eval(str(events_df.iloc[iRow]["institutions"]))[0]
+                date_first_public = events_df.iloc[iRow]["date_first_public"]
+                year = date_first_public.year
+                case_study_summary = str(events_df.iloc[iRow]["title"])
+                
+                SEARCH_START_DATE = date_first_public.strftime('%Y-%m-%d')
+                SEARCH_END_DATE = (date_first_public + timedelta(days=90)).strftime('%Y-%m-%d')
 
-        with open(output_filename, 'w', encoding='utf-8') as f:
-            json.dump(final_json, f, indent=4, ensure_ascii=False)
-        print(f"📄 Results saved to {output_filename}")
+                print(f"Event ID: {event_id}")
+                print(f"Bank: {bank_name}")
+                print(f"Year: {year}")
+                print(f"Date Range: {SEARCH_START_DATE} to {SEARCH_END_DATE}")
+                print(f"Summary: {case_study_summary[:100]}...")
+                
+                articles = fetch_and_process_media_coverage(
+                    bank_name, 
+                    str(year), 
+                    case_study_summary, 
+                    num_articles_to_find=TOTAL_ARTICLES_TO_FIND, 
+                    start_date=SEARCH_START_DATE, 
+                    end_date=SEARCH_END_DATE
+                )
+                
+                print(f"\n✅ Success! Processed {len(articles)} articles for {bank_name}.\n")
+                
+                final_json = {
+                    "event_id": event_id,
+                    "bank_name": bank_name, 
+                    "year": year, 
+                    "case_study_summary": case_study_summary,
+                    "article_count": len(articles),
+                    "relevant_article_count": sum(1 for a in articles if a.is_relevant),
+                    "articles": [a.model_dump(mode='json') for a in articles if a.is_relevant]
+                }
+                
+                output_filename = os.path.join(output_dir, f"{bank_name.replace(' ', '_')}_{year}_media_analysis.json")
+
+                with open(output_filename, 'w', encoding='utf-8') as f:
+                    json.dump(final_json, f, indent=4, ensure_ascii=False)
+                print(f"📄 Results saved to {output_filename}")
+                
+                # Add a delay between events to avoid rate limiting
+                if iRow < len(events_df) - 1:  # Don't delay after the last event
+                    print(f"⏳ Waiting 5 seconds before processing next event...")
+                    time.sleep(5)
+                    
+            except Exception as e:
+                print(f"❌ Error processing event {iRow + 1} ({bank_name if 'bank_name' in locals() else 'Unknown'}): {e}")
+                print(f"Continuing with next event...")
+                continue
+        
+        print(f"\n{'='*80}")
+        print(f"✅ Completed processing all {len(events_df)} events!")
+        print(f"{'='*80}")
 
     except FileNotFoundError:
         print("❌ Error: 'us_bank_reputation_events_final.xlsx' not found. Please ensure the file is in the correct directory.")
